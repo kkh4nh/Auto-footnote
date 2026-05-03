@@ -1,0 +1,7 @@
+IF your anaconda can't run then install this then run it
+conda install <library_name>
+
+When run use (i put the code in documents so it show this)
+C:\Users\_______>cd Documents
+C:\Users\_______\Documents>cd Code_Footnote_Auto
+C:\Users\______\Documents\Code_Footnote_Auto>python code.py
