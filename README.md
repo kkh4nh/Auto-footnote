@@ -12,6 +12,6 @@ Auto footnote for word
 #English
 
 -Warning: to use this you must understand:
-+The Word file must not have existing footnotes, otherwise it will cause errors.
-+For the parts where you want footnotes, please enclose them in parentheses, for example: (hi the world). It will convert everything inside the parentheses into a footnote and simultaneously remove that part from the main text.
-+It will automatically move the parts with parentheses ( , ), so please be careful, otherwise it may turn other data into footnotes.
++ The Word file must not have existing footnotes, otherwise it will cause errors.
++ For the parts where you want footnotes, please enclose them in parentheses, for example: (hi the world). It will convert everything inside the parentheses into a footnote and simultaneously remove that part from the main text.
++ It will automatically move the parts with parentheses ( , ), so please be careful, otherwise it may turn other data into footnotes.
