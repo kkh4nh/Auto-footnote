@@ -24,14 +24,17 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 
-# Nội dung trong (...) phải kết thúc bằng một trong các dấu sau (được giữ lại trong thân văn bản).
-PAREN_FOOTNOTE = re.compile(r"\(([^)]*)\)([.,;:!?])")
+# Nội dung trong (...) rồi đến dấu câu (được giữ lại trong thân văn bản).
+# Cho phép khoảng trắng giữa ")" và dấu câu; nhận cả dấu câu fullwidth.
+PAREN_FOOTNOTE = re.compile(r"\(([^)]*)\)(\s*)([.,;:!?。；：！？])")
+
+# Ký tự cấu trúc Word: không được xóa (ô bảng, ngắt trang, dấu footnote, …).
+_WD_STRUCT = frozenset("\x01\x02\x03\x04\x05\x07\x08\x0b\x0c")
 
 
 def default_output_path(input_path: Path) -> Path:
-    """Luôn sinh file mới cạnh file gốc: ten_footnote.docx /.doc"""
-    suf = input_path.suffix if input_path.suffix.lower() in (".docx", ".doc") else ".docx"
-    return input_path.with_name(f"{input_path.stem}_footnote{suf}")
+    """Luôn sinh file mới cạnh file gốc (ưu tiên .docx — ổn định hơn .doc)."""
+    return input_path.with_name(f"{input_path.stem}_footnote.docx")
 
 
 def resolve_output_path(input_path: Path, output_path: Path | None) -> Path:
@@ -81,54 +84,148 @@ def _ensure_word():
     return win32
 
 
-def parenthetical_ranges_to_footnotes(doc, matches_desc: list[re.Match[str]]) -> int:
+def _clean_fn_text(s: str) -> str:
+    for ch in _WD_STRUCT:
+        s = s.replace(ch, "")
+    return s.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _prepare_doc(doc) -> None:
+    """Gỡ khóa / tắt track changes để Word cho phép xóa và chèn footnote."""
+    try:
+        wd_none = -1  # wdNoProtection
+        if int(doc.ProtectionType) != wd_none:
+            try:
+                doc.Unprotect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        doc.TrackRevisions = False
+    except Exception:
+        pass
+
+
+def _try_delete_span(doc, start: int, end: int) -> bool:
     """
-    matches_desc: các match theo thứ tự m.start() giảm dần để chỉnh sửa không làm lệch offset.
-    Trả về số footnote đã chèn.
+    Xóa [start, end) trên truyện chính. Range COM không được giữ qua thao tác khác.
+    Trả về False nếu không xóa được gì (ô bảng / nội dung khóa).
+    """
+    if end <= start:
+        return False
+    start, end = int(start), int(end)
+
+    rng = doc.Range(start, end)
+    raw = rng.Text or ""
+    if not raw:
+        return False
+    if any(ch in _WD_STRUCT for ch in raw):
+        return _delete_chars_skip_struct(doc, start, end)
+
+    try:
+        rng.Delete()
+        return True
+    except Exception:
+        pass
+    try:
+        rng = doc.Range(start, end)
+        rng.Text = ""
+        return True
+    except Exception:
+        return _delete_chars_skip_struct(doc, start, end)
+
+
+def _delete_chars_skip_struct(doc, start: int, end: int) -> bool:
+    n_ok = 0
+    for pos in range(end - 1, start - 1, -1):
+        cr = doc.Range(pos, pos + 1)
+        t = cr.Text or ""
+        if not t or t[0] in _WD_STRUCT or t[0] == "\r":
+            continue
+        try:
+            cr.Delete()
+            n_ok += 1
+        except Exception:
+            try:
+                cr.Text = ""
+                n_ok += 1
+            except Exception:
+                continue
+    return n_ok > 0
+
+
+def _replace_parens_with_footnote(doc, w_s: int, w_e: int, inner: str) -> bool:
+    """
+    Xóa "(...)" trước, rồi chèn footnote tại chỗ đó.
+    Không giữ Range COM qua Footnotes.Add — tránh lỗi 'The range cannot be deleted'
+    (Range cũ bị phình ra gồm cả dấu footnote, Word từ chối xóa).
+    """
+    inner = _clean_fn_text(inner)
+    if not inner:
+        return False
+
+    probe = doc.Range(int(w_s), int(w_e))
+    raw = probe.Text or ""
+    if "(" not in raw or ")" not in raw:
+        return False
+
+    if not _try_delete_span(doc, w_s, w_e):
+        return False
+
+    insert_rng = doc.Range(int(w_s), int(w_s))
+    fn = doc.Footnotes.Add(Range=insert_rng)
+    fn.Range.Text = inner
+    return True
+
+
+def parenthetical_ranges_to_footnotes(
+    doc, matches_desc: list[re.Match[str]], story_start: int = 0
+) -> tuple[int, int]:
+    """
+    matches_desc: match theo m.start() giảm dần.
+    story_start: doc.Content.Start (thường 0). Offset Python phải khớp ký tự Word
+    (đã chuẩn hóa \\r\\n → \\r).
+    Trả về (số footnote đã chèn, số vị trí bỏ qua).
     """
     done = 0
-    punct_len = lambda m: len(m.group(2))
+    skipped = 0
 
     for m in matches_desc:
         inner = (m.group(1) or "").strip()
         if not inner:
             continue
 
-        py_start = m.start()
-        py_end_exclusive = m.end() - punct_len(m)
+        # group(2)=khoảng trắng sau ")", group(3)=dấu câu — không xóa.
+        keep = len(m.group(2) or "") + len(m.group(3) or "")
+        w_s = int(story_start) + m.start()
+        w_e = int(story_start) + m.end() - keep
 
-        word_start = py_start + 1
-        word_end = py_end_exclusive + 1
+        try:
+            if _replace_parens_with_footnote(doc, w_s, w_e, inner):
+                done += 1
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
 
-        # Chèn dấu footnote tại điểm cuối ngoặc (trước dấu câu),
-        # sau đó xóa toàn bộ "(...)" khỏi thân bài.
-        delete_rng = doc.Range(word_start, word_end)
-        if not delete_rng.Text or delete_rng.Text.strip() == "":
-            continue
-
-        insert_rng = doc.Range(word_end, word_end)
-        fn = doc.Footnotes.Add(Range=insert_rng)
-        fn.Range.Text = inner
-        delete_rng.Text = ""
-
-        done += 1
-
-    return done
+    return done, skipped
 
 
-def convert_by_paragraph_scan(doc) -> int:
+def convert_by_paragraph_scan(doc) -> tuple[int, int]:
     """
-    Quét từng Paragraph, căn chỉnh Range qua Paragraph.Range.Start + offset.
-    Không dùng WordFind wildcard — tránh lỗi "Pattern Match expression which is not valid".
+    Quét từng Paragraph, căn Range qua Paragraph.Range.Start + offset.
+    Không dùng Word Find wildcard — tránh lỗi pattern.
+    Trả về (đã chèn, bỏ qua).
     """
     inserted = 0
+    skipped = 0
     pc = int(doc.Paragraphs.Count)
 
-    # Duyệt đoạn từ cuối lên: an toàn hơn khi chỉnh sửa tài liệu.
     for i in range(pc, 0, -1):
         para = doc.Paragraphs(i)
         pr = para.Range
-        txt = pr.Text or ""
+        txt = (pr.Text or "").replace("\r\n", "\r")
         if "(" not in txt:
             continue
 
@@ -141,49 +238,61 @@ def convert_by_paragraph_scan(doc) -> int:
             inner = (m.group(1) or "").strip()
             if not inner:
                 continue
-            lp = len(m.group(2))
+            keep = len(m.group(2) or "") + len(m.group(3) or "")
             w_s = base + m.start()
-            w_e = base + m.end() - lp
-            delete_rng = doc.Range(w_s, w_e)  # "(...)" cần xóa
-            if not (delete_rng.Text or "").strip():
-                continue
-            insert_rng = doc.Range(w_e, w_e)  # chèn ngay sau ")" (trước dấu câu)
-            fn = doc.Footnotes.Add(Range=insert_rng)
-            fn.Range.Text = inner
-            delete_rng.Text = ""
-            inserted += 1
+            w_e = base + m.end() - keep
+            try:
+                if _replace_parens_with_footnote(doc, w_s, w_e, inner):
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
 
-    return inserted
+    return inserted, skipped
 
 
-def convert_doc(input_path: Path, output_path: Path | None) -> int:
+def convert_doc(input_path: Path, output_path: Path | None) -> tuple[int, int]:
     win32 = _ensure_word()
     wd_do_not_save = getattr(win32.constants, "wdDoNotSaveChanges", 0)
 
     word = win32.Dispatch("Word.Application")
     word.Visible = False
     word.DisplayAlerts = 0
+    try:
+        word.ScreenUpdating = False
+    except Exception:
+        pass
 
     out = resolve_output_path(input_path, output_path)
     abs_in = str(input_path.resolve())
     abs_out = str(out.resolve())
+    if abs_out.lower() == abs_in.lower():
+        out = default_output_path(input_path)
+        abs_out = str(out.resolve())
 
     doc = None
     try:
-        doc = word.Documents.Open(abs_in)
+        doc = word.Documents.Open(abs_in, ReadOnly=False, AddToRecentFiles=False)
+        _prepare_doc(doc)
 
-        inserted = convert_by_paragraph_scan(doc)
-        if inserted == 0:
-            raw = doc.Content.Text
+        inserted, skipped = convert_by_paragraph_scan(doc)
+        if inserted == 0 and skipped == 0:
+            raw = (doc.Content.Text or "").replace("\r\n", "\r")
             all_matches = list(PAREN_FOOTNOTE.finditer(raw))
             ordered = sorted(all_matches, key=lambda x: x.start(), reverse=True)
-            inserted = parenthetical_ranges_to_footnotes(doc, ordered)
+            story0 = int(doc.Content.Start)
+            inserted, skipped = parenthetical_ranges_to_footnotes(doc, ordered, story0)
 
         filefmt = _wd_save_format(win32, out)
         doc.SaveAs2(abs_out, filefmt)
 
-        return inserted
+        return inserted, skipped
     finally:
+        try:
+            word.ScreenUpdating = True
+        except Exception:
+            pass
         if doc is not None:
             doc.Close(wd_do_not_save)
         word.Quit(wd_do_not_save)
@@ -276,11 +385,16 @@ def run_gui() -> None:
         ent_out.configure(state="disabled" if on else "normal")
         btn_out.configure(state="disabled" if on else "normal")
 
-    def finish_ok(n: int, out_path: str) -> None:
+    def finish_ok(n: int, skipped: int, out_path: str) -> None:
         set_busy(False)
-        msg = f"Đã chèn {n} footnote.\nLưu tại:\n{out_path}"
+        extra = ""
+        if skipped:
+            extra = (
+                f"\nBỏ qua {skipped} vị trí (bảng/ô khóa hoặc Word không cho xóa)."
+            )
+        msg = f"Đã chèn {n} footnote.{extra}\nLưu tại:\n{out_path}"
         set_log(msg)
-        messagebox.showinfo("Xong", f"Đã chèn {n} footnote.\n{out_path}")
+        messagebox.showinfo("Xong", f"Đã chèn {n} footnote.{extra}\n{out_path}")
 
     def finish_err(err: str) -> None:
         set_busy(False)
@@ -308,11 +422,20 @@ def run_gui() -> None:
 
             pythoncom.CoInitialize()
             try:
-                n = convert_doc(inp, out)
+                n, skipped = convert_doc(inp, out)
                 outp = str(resolve_output_path(inp, out).resolve())
-                root.after(0, lambda nn=n, op=outp: finish_ok(nn, op))
+                root.after(
+                    0,
+                    lambda nn=n, sk=skipped, op=outp: finish_ok(nn, sk, op),
+                )
             except Exception as e:
                 err_txt = str(e)
+                if "range cannot be deleted" in err_txt.lower():
+                    err_txt = (
+                        "Word không xóa được đoạn chữ (thường do bảng, ô, "
+                        "hoặc file đang được Word khác mở).\n"
+                        "Hãy đóng file trong Word rồi thử lại; hoặc lưu thành .docx."
+                    )
                 root.after(0, lambda t=err_txt: finish_err(t))
             finally:
                 pythoncom.CoUninitialize()
@@ -361,13 +484,15 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        n = convert_doc(inp, args.output)
+        n, skipped = convert_doc(inp, args.output)
     except Exception as e:
         sys.stderr.write(f"Loi: {e}\n")
         sys.exit(1)
 
     out_p = resolve_output_path(inp, args.output)
     print(f"Da chen {n} footnote.")
+    if skipped:
+        print(f"Bo qua {skipped} vi tri.")
     print(f"Luu tai: {out_p.resolve()}")
 
 
